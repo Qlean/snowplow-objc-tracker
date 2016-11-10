@@ -22,10 +22,10 @@
 
 #import "Snowplow.h"
 #import "SPSession.h"
-#import "SPUtils.h"
+#import "SPUtilities.h"
 #import "SPWeakTimerTarget.h"
 
-#if TARGET_OS_IPHONE
+#if SNOWPLOW_TARGET_IOS
 #import <UIKit/UIKit.h>
 #endif
 
@@ -33,15 +33,17 @@
     NSInteger   _foregroundTimeout;
     NSInteger   _backgroundTimeout;
     NSInteger   _checkInterval;
-    NSInteger   _accessedLast;
+    NSNumber *  _accessedLast;
     BOOL        _inBackground;
     NSString *  _userId;
     NSString *  _currentSessionId;
     NSString *  _previousSessionId;
     NSInteger   _sessionIndex;
     NSString *  _sessionStorage;
+    NSString *  _firstEventId;
     NSTimer *   _sessionTimer;
-    NSMutableDictionary * _sessionDict;
+    NSDictionary * _sessionDict;
+    dispatch_queue_t _sessionQueue;
 }
 
 NSString * const kSessionSavePath = @"session.dict";
@@ -53,20 +55,20 @@ NSString * const kSessionSavePath = @"session.dict";
 - (id) initWithForegroundTimeout:(NSInteger)foregroundTimeout andBackgroundTimeout:(NSInteger)backgroundTimeout andCheckInterval:(NSInteger)checkInterval {
     self = [super init];
     if (self) {
+        _sessionQueue = dispatch_queue_create("com.snowplow.sessionUpdates", DISPATCH_QUEUE_SERIAL);
         _foregroundTimeout = foregroundTimeout * 1000;
         _backgroundTimeout = backgroundTimeout * 1000;
         _checkInterval = checkInterval;
         _inBackground = NO;
         _sessionStorage = @"SQLITE";
-        
+
         NSDictionary * maybeSessionDict = [self getSessionFromFile];
         if (maybeSessionDict == nil) {
-            _userId = [SPUtils getEventId];
-            _currentSessionId = @"";
+            _userId = [SPUtilities getEventId];
+            _currentSessionId = nil;
         } else {
             _userId = [maybeSessionDict valueForKey:kSPSessionUserId];
             _currentSessionId = [maybeSessionDict valueForKey:kSPSessionId];
-            _previousSessionId = [maybeSessionDict valueForKey:kSPSessionPreviousId];
             _sessionIndex = [[maybeSessionDict valueForKey:kSPSessionIndex] intValue];
         }
         
@@ -77,7 +79,7 @@ NSString * const kSessionSavePath = @"session.dict";
         [self startChecker];
         
         // Trigger notification for view changes
-        #if TARGET_OS_IPHONE
+        #if SNOWPLOW_TARGET_IOS
         [[NSNotificationCenter defaultCenter] addObserver:self
                                                  selector:@selector(updateInBackground)
                                                      name:UIApplicationDidEnterBackgroundNotification
@@ -94,6 +96,10 @@ NSString * const kSessionSavePath = @"session.dict";
 // --- Public
 
 - (void) startChecker {
+    if (_sessionTimer != nil) {
+        [self stopChecker];
+    }
+    
     dispatch_async(dispatch_get_main_queue(), ^{
         _sessionTimer = [NSTimer scheduledTimerWithTimeInterval:_checkInterval
                                                          target:[[SPWeakTimerTarget alloc] initWithTarget:self andSelector:@selector(checkSession:)]
@@ -122,9 +128,13 @@ NSString * const kSessionSavePath = @"session.dict";
     [self startChecker];
 }
 
-- (NSMutableDictionary *) getSessionDict {
+- (NSDictionary *) getSessionDictWithEventId:(NSString *)firstEventId {
     [self updateAccessedLast];
-    return _sessionDict;
+    if (_firstEventId == nil) {
+        _firstEventId = firstEventId;
+        [self addFirstEventIdToDict];
+    }
+    return [_sessionDict copy];
 }
 
 - (NSInteger) getForegroundTimeout {
@@ -154,7 +164,9 @@ NSString * const kSessionSavePath = @"session.dict";
     BOOL result = NO;
     if ([paths count] > 0) {
         NSString * savePath = [[paths lastObject] stringByAppendingPathComponent:kSessionSavePath];
-        NSDictionary * sessionDict = _sessionDict;
+        NSMutableDictionary * sessionDict = [NSMutableDictionary dictionaryWithDictionary:[_sessionDict copy]];
+        [sessionDict removeObjectForKey:kSPSessionPreviousId];
+        [sessionDict removeObjectForKey:kSPSessionStorage];
         result = [sessionDict writeToFile:savePath atomically:YES];
     }
     return result;
@@ -171,8 +183,8 @@ NSString * const kSessionSavePath = @"session.dict";
 }
 
 - (void) checkSession:(NSTimer *)timer {
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        NSInteger checkTime = [SPUtils getTimestamp];
+    dispatch_async(_sessionQueue, ^{
+        NSNumber *checkTime = [SPUtilities getTimestamp];
         NSInteger range = 0;
         
         if (_inBackground) {
@@ -181,7 +193,7 @@ NSString * const kSessionSavePath = @"session.dict";
             range = _foregroundTimeout;
         }
         
-        if (![self isTimeInRangeWithStartTime:_accessedLast andCheckTime:checkTime andRange:range]) {
+        if (![self isTimeInRangeWithStartTime:_accessedLast.longLongValue andCheckTime:checkTime.longLongValue andRange:range]) {
             [self updateSession];
             [self updateAccessedLast];
             [self updateSessionDict];
@@ -192,27 +204,34 @@ NSString * const kSessionSavePath = @"session.dict";
 
 - (void) updateSession {
     _previousSessionId = _currentSessionId;
-    _currentSessionId = [SPUtils getEventId];
+    _currentSessionId = [SPUtilities getEventId];
     _sessionIndex++;
+    _firstEventId = nil;
 }
 
 - (void) updateAccessedLast {
-    _accessedLast = [SPUtils getTimestamp];
+    _accessedLast = [SPUtilities getTimestamp];
 }
 
 - (void) updateSessionDict {
     NSMutableDictionary * newSessionDict = [[NSMutableDictionary alloc] init];
     [newSessionDict setObject:_userId forKey:kSPSessionUserId];
     [newSessionDict setObject:_currentSessionId forKey:kSPSessionId];
-    [newSessionDict setObject:_previousSessionId forKey:kSPSessionPreviousId];
+    [newSessionDict setObject:(_previousSessionId != nil ? _previousSessionId : [NSNull null]) forKey:kSPSessionPreviousId];
     [newSessionDict setObject:[NSNumber numberWithInt:(int)_sessionIndex] forKey:kSPSessionIndex];
     [newSessionDict setObject:_sessionStorage forKey:kSPSessionStorage];
-    _sessionDict = newSessionDict;
+    _sessionDict = [newSessionDict copy];
 }
 
-- (BOOL) isTimeInRangeWithStartTime:(NSInteger)startTime
-                       andCheckTime:(NSInteger)checkTime
-                           andRange:(NSInteger)range {
+- (void) addFirstEventIdToDict {
+    NSMutableDictionary *dictionary = [_sessionDict mutableCopy];
+    [dictionary setObject:_firstEventId forKey:kSPSessionFirstEventId];
+    _sessionDict = dictionary;
+}
+
+- (BOOL) isTimeInRangeWithStartTime:(long long)startTime
+                       andCheckTime:(long long)checkTime
+                           andRange:(long long)range {
     return startTime > (checkTime - range);
 }
 
