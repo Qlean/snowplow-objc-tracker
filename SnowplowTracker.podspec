@@ -24,7 +24,7 @@ s.source           = { :git => 'https://github.com/Qlean/snowplow-objc-tracker.g
 
   s.ios.frameworks = 'CoreTelephony', 'UIKit', 'Foundation'
   s.osx.frameworks = 'AppKit', 'Foundation'
-  s.dependency 'FMDB', '= 2.6.2'
+  s.dependency 'FMDB', '2.6.2'
   s.ios.dependency 'Reachability', '~> 3.2'
 
   s.prefix_header_contents = <<-EOS
